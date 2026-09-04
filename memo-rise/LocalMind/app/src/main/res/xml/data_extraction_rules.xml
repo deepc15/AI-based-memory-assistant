@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Chat history is excluded from cloud backup and device-to-device transfer on purpose.
+  Backing up the SQLCipher file would put the conversation on Google's servers, which
+  is exactly what this app promises not to do. The Keystore wrapping key is not
+  transferable anyway, so a restored copy would be undecryptable.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="database" path="localmind.db" />
+        <exclude domain="database" path="localmind.db-wal" />
+        <exclude domain="database" path="localmind.db-shm" />
+        <exclude domain="sharedpref" path="localmind_secure.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="database" path="localmind.db" />
+        <exclude domain="sharedpref" path="localmind_secure.xml" />
+    </device-transfer>
+</data-extraction-rules>
