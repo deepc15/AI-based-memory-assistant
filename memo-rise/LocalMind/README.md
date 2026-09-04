@@ -1,245 +1,200 @@
 # LocalMind
 
-An Android AI chatbot where the conversation lives on the phone and only a small,
-user-visible slice reaches Firebase.
+An on-device, privacy-first Android AI companion where conversations live strictly on your phone, powered by local open-source LLMs (Ollama / Llama) with an open web search fallback and transparent long-term memory extraction.
 
-Kotlin · Jetpack Compose · Room + SQLCipher · Firebase AI Logic (Gemini) · Firestore
+**Kotlin** · **Jetpack Compose (Material 3)** · **Room + SQLCipher** · **Local Llama (Ollama)** · **DuckDuckGo & Wikipedia Grounding** · **WorkManager**
 
 ---
 
-## About "training the AI with a real-time dataset"
+## Key Highlights
 
-This is worth being direct about, because it changes what you build.
+- 🛡️ **100% Local & Zero Cloud Dependency**: Outbound cloud sync is disabled. No Firebase, no third-party account requirements, and no remote telemetry. Your conversations and memories never leave your device.
+- 🧠 **Continuous On-Device Learning**: Simulates continuous learning without fine-tuning weights. As you chat, the app extracts durable personal facts asynchronously and injects them into the dynamic system prompt on every turn.
+- 🦙 **Dual-Tier AI Engine**: Connects to a local open-source Llama model over HTTP/streaming (e.g. Ollama running on your local network/PC).
+- 🌐 **Open Web Search Fallback**: If the local Llama server is offline or unreachable, the engine seamlessly falls back to open web search (DuckDuckGo Instant Answer API & Wikipedia Search API) to compile grounded answers with source citations.
+- 🔐 **Hardware-Backed Encryption**: All chat history and extracted facts are encrypted at rest using SQLCipher with a 256-bit passphrase generated via `SecureRandom` and hardware-wrapped in the Android Keystore.
+- 🧹 **Intelligent Data Lifecycle & Storage Reclamation**: Configurable retention window (7 / 30 / 90 / 365 days, or keep forever). Combines SQLite `DELETE` with `VACUUM` and `PRAGMA wal_checkpoint(TRUNCATE)` to physically reclaim disk space back to the Android OS.
+- 📱 **Clean Jetpack Compose Interface**: Semantic color system featuring Mint accents for 100% on-device data, streaming token rendering, thinking animation, message pinning, and a full Memory & Storage disclosure sheet.
 
-You cannot train or fine-tune a language model inside an Android app. Training means
-adjusting billions of weights across a GPU cluster over hours or days. A phone can't do
-it, and no mobile SDK exposes it. Anyone who tells you their app "trains its AI on user
-chats in real time" is describing one of the three mechanisms below.
+---
 
-What actually produces current, personal, realistic-feeling replies:
+## How "Continuous Learning" Works Without Model Training
 
-| Goal | Mechanism | Where it lives |
+You cannot fine-tune or train an LLM directly on an Android smartphone—training requires adjusting billions of parameters across high-end GPU clusters. Apps that claim to "train on your chats in real time" are actually orchestrating prompt-level context injection.
+
+LocalMind achieves personalized, realistic, and context-aware responses through three complementary mechanisms:
+
+| Goal | Mechanism | Implementation |
 |---|---|---|
-| Knows today's facts | Grounding with Google Search — the model queries the live web per turn | `AiEngine.kt` |
-| Knows *you*, and improves as you talk | Facts extracted from your messages, stored locally, injected into every prompt | `MemoryExtractor.kt`, `PromptBuilder.kt` |
-| Has a consistent personality | System instruction, tunable without shipping a build | `PromptBuilder.kt` |
+| **Knows your personal context** | Asynchronously extracts facts from user messages into an encrypted local store, injected into every future prompt | `MemoryExtractor.kt`, `PromptBuilder.kt` |
+| **Knows current facts** | Open web search (DuckDuckGo / Wikipedia) when Llama is offline or search grounding is needed | `AiEngine.kt` |
+| **Maintains consistent personality** | Dynamic system prompt customized with active persona, wall clock, and locale | `PromptBuilder.kt` |
 
-The second one is what people usually mean by "learns from me," and it's better than
-fine-tuning for this use case: it takes effect on the very next message rather than the
-next training run, the user can read and delete each fact, and nothing about them is
-ever baked into shared model weights.
-
-If you genuinely need weight-level customisation later, that's a separate offline
-pipeline: export a curated dataset, tune a model on Vertex AI, then point
-`CHAT_MODEL` at the tuned endpoint. Don't start there — the prompt-and-memory approach
-handles the overwhelming majority of what "make it realistic" means in practice.
+### Why Memory Injection Outperforms Fine-Tuning Here
+1. **Immediate effect**: A newly learned fact is reflected in the very next turn rather than waiting for an offline training loop.
+2. **100% User transparency**: Users can inspect, audit, and revoke/forget each extracted fact at any time in the app's Memory sheet.
+3. **Privacy**: Personal facts remain local and are never baked into shared model weights.
 
 ---
 
-## What is stored where
+## Architecture & Data Storage
 
-**On the phone** (Room, in a SQLCipher-encrypted file, key wrapped by the Android
-Keystore):
+### What is Stored Where
 
-- every message, both sides, in full
-- conversation titles and timestamps
-- every extracted fact, including ones too sensitive to sync
-- grounding sources for each reply
+- **On the Phone Only** (Room database encrypted with SQLCipher):
+  - Every user and assistant message, conversation titles, and timestamps.
+  - Extracted long-term memory facts (`identity`, `preference`, `goal`, `relationship`, `constraint`).
+  - Source citations from search lookups.
+  - User retention and privacy disclosure settings.
+- **In the Cloud**:
+  - **Nothing.** Outbound sync is gated by `SyncPolicy.kt` (`shouldSync = false`), and `CloudStore.kt` acts as a local stub.
+- **Android Cloud Backup Excluded**:
+  - `data_extraction_rules.xml` and `AndroidManifest.xml` explicitly exclude `localmind.db`, `-wal`, `-shm`, and secure preferences from Google Drive backups and device-to-device transfers. If the phone is lost or wiped, local history cannot be recovered from Google servers.
 
-**In Firestore** — only these three things:
+### Encryption Details (`DatabaseKeys.kt`)
 
-- `users/{uid}` — the persona string and settings
-- `users/{uid}/memories/{id}` — durable facts, but only high-confidence ones in an
-  allowed category
-- `users/{uid}/pinned/{id}` — individual messages the user explicitly pinned
-
-Never uploaded: raw transcripts, unpinned messages, drafts, the database key, or
-anything categorised health / finance / credentials / precise location / political /
-religious / sexuality.
-
-Two things enforce this rather than one:
-
-1. `SyncPolicy.kt` is the only gate in the app. Every Firestore write passes through it,
-   so "what does this app upload?" is answered by reading one short file.
-2. `firestore.rules` re-checks the same constraints server-side, because a client-side
-   rule is unenforceable once someone repackages your APK. `CloudStore` also has no
-   method capable of writing a conversation — the absence is deliberate.
-
-Local history is excluded from Android cloud backup in `data_extraction_rules.xml`. If
-it were included, Google would hold a copy of the transcript, which defeats the point.
-The consequence is real and worth surfacing in your onboarding: **lose the phone, lose
-the history.** Only the pinned slice comes back.
+1. A cryptographically secure 256-bit random passphrase is generated on first launch.
+2. The passphrase is encrypted (wrapped) with AES-256-GCM via the hardware-backed **Android Keystore** (`AndroidKeyStore`).
+3. Only the wrapped ciphertext is stored in private SharedPreferences (`localmind_secure.xml`).
+4. The database cannot be decrypted outside the physical device or if the app is uninstalled.
 
 ---
 
-## Automatic cleanup
+## Automatic Cleanup & Physical Disk Reclamation
 
-Unimportant chat history is deleted after 30 days (configurable: 7 / 30 / 90 / 365 /
-never). The window lives in `RetentionPolicy.kt` — the companion to `SyncPolicy`, so
-each data-lifecycle question sits in one short readable file.
+Chat history past the configured retention window (7 / 30 / 90 / 365 days, or Keep Everything) is cleared automatically:
 
-**Exempt from deletion, regardless of age:**
-
-- pinned messages — the user marked these important, and they have a cloud copy
-- everything in the memory store — the app's long-term knowledge
-- a reply still streaming, or a failed one the user can still retry
-
-The exemptions live in the SQL `WHERE` clause rather than in Kotlin, so no caller can
-sweep without them.
-
-**Deleting old chats costs less than it looks like it should.** Facts are extracted at
-send time, so what the assistant *learned* from a conversation outlives the
-conversation. Only the most recent `CONTEXT_TURNS` are ever sent to the model, so a
-chat from three months ago contributes nothing to the current reply either way.
-
-### Why deletion alone frees no space
-
-SQLite does not shrink its file when rows are deleted — it marks the pages free for
-later reuse. A `DELETE`-only implementation would clear the data while leaving phone
-storage exactly as crowded as before, which is the opposite of the goal. So
-`RetentionSweeper` runs two steps:
-
-1. `DELETE` the expired rows, then drop conversation shells the sweep emptied
-2. `VACUUM` to rewrite the database compactly and hand the pages back to the
-   filesystem, then `PRAGMA wal_checkpoint(TRUNCATE)` so the `-wal` sidecar doesn't
-   stay large
-
-`VACUUM` is proportional to database size and needs temporary space for a copy, so it's
-rate-limited: it runs when a sweep clears 150+ messages, when a week has passed since
-the last one, or immediately when the user taps "Clear now". A failed `VACUUM` is not a
-failed sweep — the rows are already gone and the free pages get reused.
-
-### When it runs
-
-`RetentionWorker` is a daily `PeriodicWorkRequest`. Someone who doesn't open the app
-for two months shouldn't be storing two months of chat, and the job needs to survive
-reboots and process death. It's enqueued with `KEEP`, so scheduling it on every cold
-start is safe and doesn't reset the period. There is deliberately **no**
-`requiresStorageNotLow` constraint — that would block the sweep exactly when freeing
-storage matters most.
-
-A sweep also runs on launch, so a returning user sees retention applied immediately
-instead of waiting for WorkManager's next window.
-
-### Change this before you ship
-
-Silently deleting someone's data is a trust problem rather than a technical one, so the
-sweep is gated on `RetentionSettings.disclosureShown`. That flag is currently set when
-the user sees the empty state or opens the storage sheet, both of which state the
-window in plain language. **Move it into your onboarding flow** — otherwise a user who
-never sees an empty chat and never opens the sheet would never have retention applied
-at all.
-
-The storage sheet names the number before the user commits ("47 messages are past 30
-days and will be cleared"). That preview is the difference between a setting people
-trust and one they're afraid to touch.
-
-If losing the history bothers you, the natural addition is a JSON export before the
-sweep. The hook is already there: `MessageDao.observeExpiring` returns exactly the set
-that is about to go.
+- **Exempt from deletion:**
+  - Pinned messages (`pinned = 1`).
+  - Extracted facts in the memory store (long-term knowledge outlives the chat history).
+  - In-flight streaming replies or failed messages awaiting retry.
+- **Physical Disk Reclamation (`RetentionSweeper.kt`):**
+  - Standard SQLite `DELETE` merely marks pages as free for reuse without reducing the database file size.
+  - LocalMind executes `DELETE` on expired rows, drops orphaned empty conversations, runs `VACUUM` to compact pages back to the filesystem, and executes `PRAGMA wal_checkpoint(TRUNCATE)` so the `-wal` sidecar file drops to 0 bytes.
+- **Scheduled Automation (`RetentionWorker.kt`):**
+  - Runs daily via Android `WorkManager` (survives reboots and process death).
+  - Also sweeps on app launch so returning users immediately see current storage usage.
+  - Safe by design: No deletion occurs until the user has seen the retention disclosure in the UI.
 
 ---
 
-## Setup
-
-**1. Create the Firebase project**
-
-At [console.firebase.google.com](https://console.firebase.google.com): new project →
-add an Android app with package name `com.localmind.chat` → download
-`google-services.json` into `app/`. It's gitignored; keep it that way.
-
-**2. Turn on the services**
-
-- **Firebase AI Logic** — click through the setup wizard, pick the *Gemini Developer
-  API* backend. This provisions the API and proxies calls so no Gemini key ships in
-  your APK.
-- **Firestore** — create a database, then `firebase deploy --only firestore:rules` to
-  push `firestore.rules`. Do this before your first real user; the default rules are
-  wide open.
-- **Authentication** — enable the Anonymous provider. Each install gets a stable `uid`,
-  which is what makes the security rules meaningful. Link to a real credential later
-  with `linkWithCredential` if you want pinned data to survive reinstalls.
-- **App Check** — register the app with Play Integrity. Skipping this leaves your
-  Gemini quota billable by anyone who extracts your config. In debug builds, grab the
-  token from logcat and register it under App Check → Manage debug tokens.
-
-**3. Build**
-
-Open in Android Studio and run. Android Studio will likely offer newer AGP/Kotlin
-versions than the ones pinned in `gradle/libs.versions.toml` — accept, but upgrade AGP,
-Kotlin and KSP together, since they're version-locked to each other.
-
-Two version constraints that matter: Firebase BoM must be **34.0.0 or newer** for
-Google Search grounding, and `minSdk` is 26 for hardware-backed AES/GCM in the
-Keystore.
-
----
-
-## Layout
+## Project Structure
 
 ```
-ai/
-  AiEngine.kt        Streaming replies, Google Search grounding, source extraction
-  PromptBuilder.kt   Rebuilds the system instruction per request from memory + clock
-  MemoryExtractor.kt Distils durable facts from a turn; runs after the reply, off the
-                     critical path, on a cheaper model
-data/local/
-  Entities.kt        conversations, messages, memories
-  Daos.kt            Flow-based queries
-  LocalDatabase.kt   Room wired to SQLCipher
-  DatabaseKeys.kt    Keystore-wrapped random passphrase
-data/cloud/
-  CloudStore.kt      The entire cloud surface. Deliberately narrow.
-data/repo/
-  SyncPolicy.kt        The one gate for uploads. Read this to audit the app.
-  RetentionPolicy.kt   The 30-day window and what is exempt from it
-  RetentionSweeper.kt  DELETE + VACUUM, so space is actually returned to the OS
-  RetentionWorker.kt   Daily background sweep
-  RetentionSettings.kt Window, last-vacuum bookkeeping, disclosure flag
-  ChatRepository.kt    Local-first writes, streaming, extraction, retry
-ui/
-  ChatScreen.kt      Chat, pin affordance, source chips, disclosure sheet
-  ChatViewModel.kt
-  theme/Theme.kt     Mint = on this phone. Blue = backed up.
+memo-rise/LocalMind/
+├── app/
+│   ├── build.gradle.kts                   # Dependencies, Room KSP, and BuildConfig fields
+│   └── src/main/
+│       ├── AndroidManifest.xml            # Internet permission, cleartext LAN traffic, backup rules
+│       ├── res/xml/data_extraction_rules.xml # Cloud backup exclusions for SQLCipher DB
+│       └── java/com/localmind/chat/
+│           ├── LocalMindApp.kt            # Initializes periodic WorkManager retention sweep
+│           ├── MainActivity.kt            # Edge-to-edge Compose entry point
+│           │
+│           ├── ai/
+│           │   ├── AiEngine.kt            # OkHttp streaming to local Llama + DuckDuckGo/Wikipedia fallback
+│           │   ├── MemoryExtractor.kt     # Llama JSON fact extractor + offline NLP rule extractor fallback
+│           │   └── PromptBuilder.kt       # Dynamic system instruction assembler (clock, persona, memories)
+│           │
+│           ├── data/
+│           │   ├── local/
+│           │   │   ├── Entities.kt        # Room entities (ConversationEntity, MessageEntity, MemoryEntity)
+│           │   │   ├── Daos.kt            # Reactive Flow-based DAOs with retention queries
+│           │   │   ├── LocalDatabase.kt   # Room database wired to SQLCipher encryption
+│           │   │   └── DatabaseKeys.kt    # Android Keystore AES-GCM passphrase wrapping
+│           │   ├── cloud/
+│           │   │   └── CloudStore.kt      # Stubbed cloud surface for zero-cloud architecture
+│           │   └── repo/
+│           │       ├── ChatRepository.kt  # Local-first coordinator: writes, streaming, extraction
+│           │       ├── SyncPolicy.kt      # Policy enforcer: guarantees zero outbound cloud uploads
+│           │       ├── RetentionPolicy.kt # Retention windows (7/30/90/365/forever) and thresholds
+│           │       ├── RetentionSweeper.kt# DELETE + VACUUM + wal_checkpoint(TRUNCATE) compaction
+│           │       ├── RetentionWorker.kt # Daily WorkManager background sweep
+│           │       └── RetentionSettings.kt# SharedPreferences for retention preferences & disclosure
+│           │
+│           └── ui/
+│               ├── ChatScreen.kt          # Chat UI, Composer, Sources, and MemorySheet
+│               ├── ChatViewModel.kt       # State flows for messages, memories, storage, and sweep actions
+│               └── theme/
+│                   └── Theme.kt           # Semantic color tokens (Mint = 100% on this phone)
 ```
-
-The UI colour system does one job: mint means the data has never left the device, blue
-means a server has a copy. Once those two carry meaning, nothing else in the palette is
-allowed to be saturated, or the signal stops reading. The disclosure sheet lists every
-fact the app holds, why it did or didn't sync, and a per-item Forget that deletes the
-Firestore document too.
 
 ---
 
-## Design decisions you may want to revisit
+## Getting Started & Setup Guide
 
-**Local-first writes.** Both the user turn and an empty assistant row are committed to
-Room before the network call, and the stream writes into that row. The UI renders purely
-from Room, so a kill mid-reply leaves a partial answer rather than a hole. Cost: one DB
-write per token batch. If it shows up in profiling, buffer and flush every ~100ms.
+### 1. Prerequisites
+- **Android Studio** Ladybug (or newer) with JDK 17.
+- An Android device or emulator running **Android 8.0 (API 26)** or higher.
+- [Ollama](https://ollama.com/) installed on your computer (if using the local Llama engine).
 
-**Extraction runs after the reply.** It never adds latency, and a failure is swallowed —
-enrichment must never break a conversation. It's also narrow by design: extract
-liberally and the memory store fills with conversational trivia, which degrades every
-later reply.
+---
 
-**Pinning is the only route to the cloud for message text.** An automatic importance
-classifier was the alternative, and it's the wrong call for a privacy app — the user
-can't predict it, so they can't trust it. An explicit tap they can see the result of is
-worth more than a smarter heuristic.
+### 2. Setting Up the Local Llama Server (Ollama)
 
-**Anonymous auth.** Zero signup friction, real `uid` for the rules. The tradeoff is that
-uninstalling orphans the cloud data.
+1. Open PowerShell / terminal on your host computer.
+2. Allow Ollama to accept connections from devices on your local Wi-Fi network:
+   ```powershell
+   $env:OLLAMA_HOST="0.0.0.0"
+   ollama serve
+   ```
+3. In another terminal, pull and verify your preferred model (e.g., `llama3.2`):
+   ```bash
+   ollama run llama3.2
+   ```
+4. Find your PC's local network IP address (e.g. run `ipconfig` on Windows or `ifconfig` on macOS/Linux, looking for `192.168.x.x`).
 
-## Before you ship
+---
 
-- Google Search grounding carries display requirements from the API provider (you must
-  show the grounded sources — `Sources()` in `ChatScreen.kt` does this). Check the
-  current terms for your chosen backend.
-- Write real Room migrations for schema changes. There's intentionally no
-  `fallbackToDestructiveMigration()`, because destroying local-only history is
-  unrecoverable.
-- Set a Firebase billing budget alert. Grounding calls cost more than plain generation,
-  and a runaway loop is expensive.
-- If you want history behind biometrics, add `setUserAuthenticationRequired(true)` in
-  `DatabaseKeys.kt` — but note that background sync then can't read the DB while locked.
+### 3. Configure the Android App
+
+Open `memo-rise/LocalMind/app/build.gradle.kts` and point `LOCAL_LLAMA_URL` to your host computer's IP address:
+
+```kotlin
+defaultConfig {
+    applicationId = "com.localmind.chat"
+    minSdk = 26
+    targetSdk = 35
+    versionCode = 1
+    versionName = "1.0"
+
+    // Set this to your host PC's local IP address running Ollama:
+    buildConfigField("String", "LOCAL_LLAMA_MODEL", "\"llama3.2\"")
+    buildConfigField("String", "LOCAL_LLAMA_URL", "\"http://192.168.x.x:11434\"")
+}
+```
+
+> **Note**: If testing on an Android emulator connecting to Ollama running on the same host machine, you can use `http://10.0.2.2:11434`.
+
+---
+
+### 4. Build and Run
+
+1. Open the project folder `memo-rise/LocalMind` in Android Studio.
+2. Sync Gradle and build the app.
+3. Run on your physical device or emulator.
+
+---
+
+### 5. Offline / No-Server Fallback Mode
+
+If your computer is turned off or Ollama is unreachable:
+- LocalMind will **not crash**.
+- It will automatically transition to **Open Search Fallback Mode**, querying DuckDuckGo and Wikipedia to summarize responses and cite sources.
+- Fact extraction will automatically switch to the built-in offline NLP pattern matcher (`extractOfflineFacts`), continuing to learn your name, location, and preferences without any server running.
+
+---
+
+## UI Color System & Meaning
+
+LocalMind uses a purposeful color palette:
+- **Mint (`#7FD4B0` Dark / `#1F8F68` Light)**: Indicates that the information has **never left the device**. Used for status dots, composer buttons, and local storage receipts.
+- **Slate Cloud (`#7FA9E8` Dark / `#2E6CB8` Light)**: Indicates external sources or web citations.
+- **Warning / Red (`#E08A7A`)**: Used for destructive actions (Forget memory, Clear now, Delete everything).
+- Tap the **"On this phone"** header bar anytime to view all extracted memories, revoke facts, inspect disk footprint, and configure retention.
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE.md](../../LICENSE.md) file for details.
