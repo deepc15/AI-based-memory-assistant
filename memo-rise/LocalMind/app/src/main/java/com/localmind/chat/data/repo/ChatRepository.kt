@@ -4,6 +4,8 @@ import android.content.Context
 import android.util.Log
 import com.localmind.chat.ai.AiEngine
 import com.localmind.chat.ai.Chunk
+import com.localmind.chat.ai.ExtractedFact
+import com.localmind.chat.ai.IntelligenceStatus
 import com.localmind.chat.ai.MemoryExtractor
 import com.localmind.chat.ai.PromptBuilder
 import com.localmind.chat.data.local.ConversationEntity
@@ -12,6 +14,7 @@ import com.localmind.chat.data.local.MemoryEntity
 import com.localmind.chat.data.local.MessageEntity
 import com.localmind.chat.data.local.Role
 import com.localmind.chat.data.local.SyncState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -28,7 +31,7 @@ import kotlinx.coroutines.withContext
  */
 class ChatRepository(
     context: Context,
-    private val ai: AiEngine = AiEngine(),
+    private val ai: AiEngine = AiEngine(context),
     private val extractor: MemoryExtractor = MemoryExtractor()
 ) {
 
@@ -39,6 +42,20 @@ class ChatRepository(
 
     /** Background work for local learning and fact extraction. */
     private val background = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    val intelligenceStatus: Flow<IntelligenceStatus> = ai.status
+
+    fun setOnlineEnabled(enabled: Boolean) {
+        ai.setOnlineEnabled(enabled)
+    }
+
+    fun setAutoMode(isAuto: Boolean) {
+        ai.setAutoMode(isAuto)
+    }
+
+    fun setManualMode(mode: IntelligenceStatus) {
+        ai.setManualMode(mode)
+    }
 
     private var persona: String = PromptBuilder.DEFAULT_PERSONA
 
@@ -91,6 +108,7 @@ class ChatRepository(
         messages.insert(reply)
 
         val buffer = StringBuilder()
+        var wasCancelled = false
         try {
             ai.stream(history, trimmed, systemInstruction).collect { chunk ->
                 when (chunk) {
@@ -110,6 +128,10 @@ class ChatRepository(
                     }
                 }
             }
+        } catch (e: CancellationException) {
+            wasCancelled = true
+            Log.i("ChatRepository", "Streaming reply cancelled by user via Stop button.")
+            messages.updateText(reply.id, "Response terminated.", streaming = false)
         } catch (e: Exception) {
             Log.e("ChatRepository", "Error streaming reply from Local Llama AI", e)
             if (buffer.isEmpty()) {
@@ -121,7 +143,10 @@ class ChatRepository(
         }
 
         titleIfNeeded(conversationId, trimmed)
-        background.launch { learnFrom(trimmed, userMessage.id) }
+        if (!wasCancelled) {
+            val completedReply = buffer.toString()
+            background.launch { learnFrom(trimmed, userMessage.id, completedReply) }
+        }
     }
 
     /** Cheap local title from the first turn. */
@@ -134,8 +159,15 @@ class ChatRepository(
     /**
      * Local AI learning: extracts facts and saves them to the encrypted local database.
      */
-    private suspend fun learnFrom(userText: String, sourceMessageId: String) {
-        extractor.extract(userText).forEach { fact ->
+    private suspend fun learnFrom(userText: String, sourceMessageId: String, replyText: String) {
+        val extractedFacts = extractor.extract(userText).toMutableList()
+
+        val infoFact = extractor.extractInformativeFact(userText, replyText)
+        if (infoFact != null) {
+            extractedFacts.add(infoFact)
+        }
+
+        extractedFacts.forEach { fact ->
             val memory = MemoryEntity(
                 text = fact.text,
                 category = fact.category,
@@ -145,6 +177,19 @@ class ChatRepository(
             )
 
             // Unique index on text means duplicates are silently ignored (-1).
+            memories.insertIfNew(memory)
+        }
+    }
+
+    suspend fun importMemoriesFromList(facts: List<ExtractedFact>) = withContext(Dispatchers.IO) {
+        facts.forEach { fact ->
+            val memory = MemoryEntity(
+                text = fact.text,
+                category = fact.category,
+                confidence = fact.confidence,
+                sourceMessageId = "imported",
+                syncState = SyncState.LOCAL_ONLY
+            )
             memories.insertIfNew(memory)
         }
     }

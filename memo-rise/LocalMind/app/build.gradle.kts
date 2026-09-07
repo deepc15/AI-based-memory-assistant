@@ -85,6 +85,9 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging)
 
+    // Hardware-accelerated on-device Llama model inference engine
+    implementation(libs.mediapipe.tasks.genai)
+
     // Schedules the retention sweep so old chats are cleared even if the app
     // is never opened.
     implementation(libs.work.runtime)

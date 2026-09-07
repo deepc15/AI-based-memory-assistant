@@ -53,6 +53,53 @@ class MemoryExtractor(
         }
     }
 
+    /**
+     * Extracts an informative question-and-answer fact when an informative prompt
+     * ("what is", "who is", "where is", "how", "why") yields a satisfactory answer.
+     */
+    fun extractInformativeFact(userQuery: String, assistantReply: String): ExtractedFact? {
+        val q = userQuery.trim().lowercase()
+        val reply = assistantReply.trim()
+
+        if (reply.length < 15) return null
+        if (reply.contains("We couldn't find", ignoreCase = true)) return null
+        if (reply.contains("I am currently running", ignoreCase = true)) return null
+
+        // Dynamic time & place constraints exclusion:
+        val dynamicKeywords = listOf(
+            "today", "tomorrow", "yesterday", "now", "right now",
+            "this morning", "this evening", "tonight", "this place",
+            "weather", "forecast", "temperature", "current"
+        )
+        if (dynamicKeywords.any { q.contains(it) }) {
+            return null // Do not learn dynamic time/place facts!
+        }
+
+        val isInformative = q.contains("what") || q.contains("who") ||
+            q.contains("where") || q.contains("how") || q.contains("why") ||
+            q.contains("tell me")
+
+        if (!isInformative) return null
+
+        // Clean query topic
+        val topic = userQuery
+            .replace(Regex("(?i)\\b(what is|what's|who is|who's|where is|where's|tell me about|tell me who|the|a|an)\\b"), "")
+            .replace("?", "")
+            .trim()
+
+        if (topic.length < 3) return null
+
+        // Format clean learned fact
+        val cleanReplyGist = reply
+            .replace(Regex("(?i)^That's a great question!\\s*"), "")
+            .replace("\n", " ")
+            .take(200)
+            .trim()
+
+        val factText = "$topic: $cleanReplyGist"
+        return ExtractedFact(text = factText, category = "informative", confidence = 0.90f)
+    }
+
     private fun extractFromLlamaServer(userText: String): List<ExtractedFact> {
         val requestJson = JSONObject().apply {
             put("model", modelName)
@@ -134,6 +181,11 @@ class MemoryExtractor(
             if (clean.length in 3..80) {
                 results.add(ExtractedFact("Goal: $clean", "goal", 0.80f))
             }
+        }
+
+        // 9. Relationships
+        matchTwoGroups(text, "(?i)\\bmy\\s+(wife|husband|partner|spouse|friend|brother|sister|mom|dad|mother|father)(?:'s name)?\\s+(?:is\\s+)?([A-Z][a-z0-9_-]+)\\b") { rel, relName ->
+            results.add(ExtractedFact("User's ${rel.lowercase()} is ${relName.trim()}", "relationship", 0.90f))
         }
 
         return results.take(MAX_PER_TURN)
